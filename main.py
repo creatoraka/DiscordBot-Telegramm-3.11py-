@@ -1,2106 +1,1741 @@
+import asyncio
+import hashlib
+import hmac
+import json
 import os
 import re
-import random
-import asyncio
-import logging
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.enums import ParseMode, ChatType
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
-    BusinessConnection
-)
+import sqlite3
+import time
 
-# ==================== КОНФИГ ====================
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from urllib.parse import parse_qsl
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("Не задана переменная окружения BOT_TOKEN")
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart
+from aiogram.types import Message, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-print("=== START BOT ===")
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-# ==================== СУПЕР-АДМИНЫ ====================
-
-# ↓ username без @, в нижнем регистре
-SUPER_ADMINS = {"creatoraka"}
-
-# ↓ user_id супер-админов (получить через @userinfobot). Можно пустым.
-SUPER_ADMIN_IDS = set()
-
-# ==================== ХРАНИЛИЩА ====================
-
-TEMP_BANS = {}
-TEMP_MUTES = {}
-RPS_GAMES = {}
-RPS_INVITES = {}
-CENSOR_ENABLED = {}
-CAPS_ENABLED = {}          # защита от капслока
-LINKS_ENABLED = {}         # защита от ссылок
-USERNAME_CACHE = {}
-USER_ID_TO_NAME = {}
-WARMED_CHATS = set()
-SERVICE_CLEANER_ENABLED = {}
-
-USER_STATS = {}
-
-BUSINESS_CONNECTIONS = {}
-
-BOT_ID = None
-
-# ==================== НОРМАЛИЗАЦИЯ ====================
-
-HOMOGLYPHS = str.maketrans({
-    "a": "а", "e": "е", "o": "о", "p": "р", "c": "с",
-    "x": "х", "y": "у", "k": "к", "m": "м", "t": "т",
-    "h": "н", "b": "в", "n": "п",
-    "0": "о", "1": "и", "3": "з", "4": "а", "6": "б", "8": "в", "9": "д",
-})
-
-NOT_LETTERS = re.compile(r"[^а-я]")
+from aiohttp import web
 
 
-def normalize(text: str) -> str:
-    if not text:
-        return ""
-    text = text.lower()
-    text = text.replace("ё", "е")
-    text = text.translate(HOMOGLYPHS)
-    text = NOT_LETTERS.sub("", text)
-    return text
+# ============================================================
+# TELEGRAMM CHAT
+# Python 3.11
+# ============================================================
 
-
-# ==================== МАТ ====================
-
-LONG_BAD = [
-    "хуесос", "хуеплет", "хуеглот", "хуемраз",
-    "пизда", "пизде", "пизду", "пизды", "пиздо",
-    "пиздец", "пиздану", "пиздато", "пиздатый",
-    "пиздюк", "пиздюл", "пиздюх",
-    "пиздобол", "пиздабол", "пиздоболка",
-    "пиздрик", "пиздрила", "пиздренок",
-    "пиздюлина", "пиздюлей", "пиздюли",
-    "распизд", "запизд", "впизд", "спизд", "испизд",
-    "напизд", "пропизд", "припизд", "допизд",
-    "блядина", "блядинк", "блядищ",
-    "блядство", "блядств", "блядск", "блядская",
-    "блядун", "блядуш",
-    "блядва", "блядво",
-    "забляд", "набляд", "пробляд",
-    "выбляд", "выблядок",
-    "добляд", "прибляд",
-    "ебан", "ебану", "ебанут", "ебанул",
-    "ебат", "ебать", "ебал",
-    "ебало", "ебальник",
-    "ебарь", "ебари",
-    "ебуч", "ебучий",
-    "ебет", "ебется",
-    "ебить", "ебитв", "ебитва",
-    "ебля", "ебли",
-    "ебло", "еблом",
-    "еблан", "ебланк",
-    "ебств", "ебусь", "ебут",
-    "ебака",
-    "заеб", "заебал", "заебись", "заебу", "заебан",
-    "наеб", "наебал", "наебать", "наебут", "наебан", "наебка",
-    "отъеб", "отъебал", "отъебать", "отъебис", "отъебись",
-    "подъеб", "подъебал", "подъебка", "подъебну",
-    "уебал", "уебать", "уебан", "уебищ",
-    "въеб", "въебал", "въебать", "въебну",
-    "проеб", "проебал", "проебать", "проебан", "проебу",
-    "разъеб", "разъебал", "разъебать", "разъебан",
-    "съеб", "съебал", "съебать", "съебался", "съебись",
-    "доебал", "доебать", "доебис", "доебись",
-    "долбоеб", "долбаеб", "долбоебка",
-    "недоеб",
-    "перееб", "переебал", "переебать", "переебан", "переебу",
-    "поебал", "поебать", "поебен", "поебень", "поебон",
-    "поебушка", "поебух", "ебалда",
-    "сучка", "сучки", "сучонок",
-    "сучара", "сучарк", "сучий", "сучья",
-    "мудак", "мудачь",
-    "мудил", "мудила", "мудило",
-    "мудозвон",
-    "мудень", "мудня",
-    "замуд", "намуд", "промуда",
-    "пидор", "пидар", "пидер",
-    "педик", "педер", "педераст",
-    "пидорас", "пидарас", "пидорасина",
-    "пидорств", "пидарств",
-    "пидорок",
-    "гандон", "гондон",
-    "кондом",
-    "паскуд", "паскудник",
-    "падлюк", "падлюка", "падлючк",
-    "гомик", "гомосек",
-    "залупка", "залупок",
-    "мандавошк", "мандав", "мандуй",
-    "шлюха", "шлюхи", "шлюхо", "шлюхе", "шлюху",
-    "шлюшка", "шлюшки", "шлюшк", "шлюшонок", "шлюшня",
-    "пошлюх",
-    "проститут", "проститух",
-    "шалава", "шалавы", "шалавищ",
-    "потаскух", "потаскушк",
-    "хабалка", "хабалк",
-    "влагалищ",
-    "спермат", "сперматозо", "сперматозоид",
-    "мошонк", "мошонка",
-    "срака", "сраку", "сраки",
-    "срать", "срала",
-    "срача", "сраче",
-    "ссать", "ссала", "ссанин",
-    "пердеж", "пердану", "пердун", "пердунь",
-    "бздеж", "бздун",
-    "говно", "говна", "говне", "говну",
-    "говнюк", "говнюшк",
-    "говня", "говнян", "говняст",
-    "дерьм", "дерьмо", "дерьма",
-    "мочалк",
-    "фекал", "фекали",
-    "испражн",
-    "экскремен",
-    "жопа", "жопу", "жопе", "жопы",
-    "жопан", "жопень",
-    "задниц", "задница", "задницу",
-    "анальн",
-    "простат", "простата",
-    "дрочи", "дрочил", "дрочить", "дрочер",
-    "онанизм", "онанист",
-    "мастурб", "мастурбац", "мастурби",
-    "минет", "миньет", "минетч",
-    "кунилингус", "кунилинг",
-    "фелляц",
-    "сексуаль", "сексуальн",
-    "половойакт",
-    "совокуп", "совокуплен",
-    "трахат", "трахаю", "трахал", "трахать", "трахнул",
-    "шмара", "шмары",
-    "дешевка",
-    "хохол", "хохлы", "хохлушк",
-    "москаль", "москаля",
-    "кацапн",
-    "жидяр",
-    "чурбан",
-    "чучмек",
-    "хачик",
-    "армяшк", "армяшка",
-    "дагест", "дагестан",
-    "чечен", "чеченец",
-    "китаез", "китаеза",
-    "немчура",
-    "фашист", "нацист",
-    "гитлер",
-    "рашист", "рашизм",
-    "ватник",
-    "героин", "герыч",
-    "кокаин",
-    "амфетамин",
-    "мефедрон",
-    "метамфетамин",
-    "марихуан",
-    "гашиш",
-    "мескалин",
-    "экстази",
-    "закладк", "закладчик",
-    "наркота", "наркотик",
-    "наркоман", "наркоманк",
-    "торчок",
-    "ширнут", "ширнул",
-    "суицид",
-    "самоубий", "самоубийств",
-    "повесит", "повешусь", "повесил",
-    "убийств", "убийц",
-    "зарежу",
-    "вскрытвен",
-    "террорист", "терроризм", "теракт",
-    "взорвать",
-    "джихад",
-    "шахид",
-    "смертник",
-    "игилов",
-    "алькаид",
-    "талиб",
-    "педофил",
-    "малолетк", "малолеток",
-    "несовершеннолетн",
-    "сволочь", "сволочи",
-    "мразь", "мрази", "мразот",
-    "тварь", "твари", "тварюг",
-    "ублюдок", "ублюдки",
-    "кретин", "кретинк",
-    "дебильн",
-    "идиот", "идиотк",
-    "придурок", "придурки",
-    "уродств",
-    "гнида", "гниды",
-    "падлюка",
-    "мерзавец", "мерзавк",
-    "негодяй",
-    "поганец",
-    "хамло",
-    "нахалюга",
-    "дегенерат",
-    "олигофрен",
-    "дауненок",
-    "аутист",
-    "изнасил", "изнасилую", "изнасиловать",
-]
-
-SHORT_BAD = [
-    "хуй", "хуя", "хую", "хуе", "хуи", "хуйн",
-    "хуйло", "хуйня", "хуец", "хуищ", "хуяч", "хуяр",
-    "хуел", "хуею", "хуев",
-    "схуя", "схуй",
-    "хер",
-    "пизд", "пизж",
-    "блядь", "бляди", "блядо", "бляде", "бляду",
-    "блять", "блят", "бляд", "бля",
-    "еб", "ебу", "еби",
-    "сука", "суки", "суке", "суку", "сукой", "сучар", "сучк",
-    "суч", "засук",
-    "мудор",
-    "ганд",
-    "пидр",
-    "гомо",
-    "манда", "манде", "манду", "манды", "мандо",
-    "шлюх", "шлюш",
-    "шлюха", "шлюхи", "шлюхе", "шлюху", "шлюхой",
-    "шалав", "потаск", "хабал", "стерв",
-    "курв", "курва", "курвы", "курво",
-    "блуд",
-    "вагин", "вагина",
-    "сперм", "сперма",
-    "яичк",
-    "срак",
-    "сру", "срал",
-    "срач", "срачь",
-    "ссат", "ссал", "ссан", "ссани",
-    "ссик", "ссику",
-    "перд", "пердну", "бзд",
-    "вонюч",
-    "моча", "мочит", "мочен",
-    "жоп",
-    "анал",
-    "анус",
-    "дроч",
-    "онан",
-    "фелл",
-    "орал",
-    "секс", "секса", "сексу", "сексе",
-    "снош",
-    "трах", "трахн",
-    "шмар",
-    "кацап", "жид",
-    "чурка", "чурки", "чурк",
-    "хач", "хачи",
-    "азерб", "узбек", "немч", "наци",
-    "нарк", "нарко", "торч",
-    "бомб", "бомба", "игил",
-    "педо",
-    "мраз", "твар",
-    "урод", "уроды", "уродина",
-    "дрян", "дрянь", "дрянн",
-    "подлец",
-    "поган",
-    "хам", "хамл", "хамск",
-    "наглец", "нагл",
-    "нахал", "наха",
-    "залупа", "залупе", "залупу", "залупы", "залупой",
-    "убью",
-    "порву", "порвать",
-    "сожгу", "сжечь",
-]
-
-WHITELIST_RAW = {
-    "херсон", "херсонес", "херсонский", "херсонская", "херсонский",
-    "мандарин", "мандарины", "мандаринка", "мандаринка",
-    "мандариновый", "мандаринчик", "мандаринчики",
-    "анализ", "анализа", "анализу", "анализом", "анализе",
-    "аналитик", "аналитика", "аналитики", "аналитику",
-    "анализировать", "анализировал", "анализирую",
-    "аналог", "аналога", "аналогия", "аналогичный", "аналогично",
-    "аналоговый",
-    "трахея", "трахеи", "трахею", "трахеей", "трахеит",
-    "трахеотомия", "трахеостомия",
-    "секстант", "секстанта", "секстанты",
-    "секция", "секции", "секцию", "секций", "секционный",
-    "секрет", "секрета", "секретный", "секретно",
-    "секретарь", "секретариат",
-    "сукаленок", "сукаленка",
-    "сукно", "сукна", "сукном", "сукне",
-    "суккулент", "суккуленты",
-    "сукровица",
-    "сракозябра", "сракозябры",
-    "половой", "половая", "половое", "половые", "половых",
-    "половинка", "половина", "половину", "половины",
-    "половник", "половники",
-    "оральный", "оральная", "оральное", "оральные",
-    "орал", "орала", "орали", "орать",
-    "сношение", "сношения", "сношению", "сношением",
-    "сносно", "сносный", "сносная", "сносное", "сносные",
-    "сноска", "сноски", "сноску",
-    "дешевка", "дешевки", "дешевке", "дешевку", "дешевкой",
-    "дешевле", "дешевый", "дешевая", "дешево",
-    "соль", "соли", "солью",
-    "соленый", "соленая", "соленое",
-    "солнечный", "солнечная", "солнце",
-    "анальный", "анальная", "анальное", "анальные",
-    "вагина", "вагины", "вагине", "вагину", "вагиной",
-    "вагинальный", "вагинальная",
-    "клитор", "клитора", "клиторе", "клитору", "клитором",
-    "клиторальный",
-    "фаллос", "фаллоса", "фаллосу", "фаллосом",
-    "пенис", "пениса", "пенису", "пенисом",
-    "пенистый", "пенистая",
-    "сексуальный", "сексуальная", "сексуальное", "сексуальные",
-    "сексуальность", "сексуально",
-    "мастурбация", "мастурбации", "мастурбацию",
-    "наркотик", "наркотики", "наркотика", "наркотиков",
-    "наркоз", "наркоза", "наркозный",
-    "хамство", "хамства", "хамству", "хамством",
-    "поганец", "поганка", "поганки",
-    "поганый", "поганая", "поганое", "поганые",
-    "трава", "травы", "траве", "траву", "травой", "травам", "травах",
-    "травинка", "травинки", "травинку",
-    "травля", "травли", "травлю",
-    "травма", "травмы", "травме", "травму", "травмой",
-    "травматолог", "травматология",
-    "траверс", "траверса",
-    "лупа", "лупы", "лупе", "лупу", "лупой",
-    "лупить", "луплю", "лупит",
-    "муравей", "муравья", "муравью", "муравьи", "муравьёв", "муравьев",
-    "муравьиный", "муравьиная", "муравейник", "муравейника",
-    "суккулент", "суккуленты", "суккулентный",
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip()
 }
 
-WHITELIST = {normalize(w) for w in WHITELIST_RAW}
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-domain.com")
+DB_PATH = "telegramm_chat.sqlite3"
+WEB_PORT = int(os.getenv("PORT", "8000"))
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+PERMISSIONS = {
+    "manage_roles",
+    "manage_members",
+    "manage_permissions",
+    "mention_roles",
+}
+
+ADMIN_PERMISSIONS = sorted(PERMISSIONS)
 
 
-def has_bad_words(text: str) -> bool:
-    if not text:
-        return False
+# ============================================================
+# DATABASE
+# ============================================================
 
-    raw_words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text)
-    norm_words = [normalize(w) for w in raw_words if normalize(w)]
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
 
-    if not norm_words:
-        return False
-
-    if len(norm_words) == 1 and norm_words[0] in WHITELIST:
-        return False
-
-    for w in norm_words:
-        if w in WHITELIST:
-            continue
-        for bad in LONG_BAD:
-            if bad in w:
-                return True
-
-    for w in norm_words:
-        if w in WHITELIST:
-            continue
-        if w in SHORT_BAD:
-            return True
-
-    all_short = all(len(w) <= 2 for w in norm_words)
-    if all_short and len(norm_words) >= 2:
-        flat = normalize(text)
-        if flat and flat not in WHITELIST:
-            for bad in SHORT_BAD:
-                if len(bad) >= 3 and bad in flat:
-                    return True
-            for bad in LONG_BAD:
-                if bad in flat:
-                    return True
-
-    if " " not in text.strip():
-        flat = normalize(text)
-        if flat and flat not in WHITELIST:
-            for bad in SHORT_BAD:
-                if len(bad) >= 3 and bad in flat:
-                    return True
-            for bad in LONG_BAD:
-                if bad in flat:
-                    return True
-
-    return False
-
-
-# ==================== КАПСЛОК ====================
-
-def is_caps_lock(text: str, min_len: int = 6, threshold: float = 0.7) -> bool:
-    """True, если текст выглядит как капслок."""
-    if not text:
-        return False
-    letters = [c for c in text if c.isalpha()]
-    if len(letters) < min_len:
-        return False
-    upper = sum(1 for c in letters if c.isupper())
-    return (upper / len(letters)) >= threshold
-
-
-# ==================== ССЫЛКИ ====================
-
-URL_RE = re.compile(
-    r"(?:https?://|www\.)[^\s<>\"']+",
-    re.IGNORECASE
-)
-
-ALLOWED_LINK_PREFIXES = (
-    "https://www.youtube.com/shorts",
-    "http://www.youtube.com/shorts",
-    "https://youtube.com/shorts",
-    "http://youtube.com/shorts",
-    "www.youtube.com/shorts",
-    "youtube.com/shorts",
-)
-
-
-def is_allowed_link(url: str) -> bool:
-    url_low = url.lower().rstrip("/")
-    for prefix in ALLOWED_LINK_PREFIXES:
-        if url_low.startswith(prefix):
-            return True
-    return False
-
-
-def has_forbidden_links(text: str) -> bool:
-    if not text:
-        return False
-    found = URL_RE.findall(text)
-    for url in found:
-        if not is_allowed_link(url):
-            return True
-    return False
-
-
-# ==================== МАГИЧЕСКИЙ ШАР ====================
-
-MAGIC_8_BALL = [
-    "🎱 Да, однозначно.", "🎱 Нет, даже не думай.", "🎱 Возможно.",
-    "🎱 Спроси позже.", "🎱 Не могу сказать сейчас.", "🎱 Абсолютно точно.",
-    "🎱 Скорее нет, чем да.", "🎱 Скорее да, чем нет.",
-    "🎱 Не рассчитывай на это.", "🎱 Все звёзды за.",
-    "🎱 Мои источники говорят «нет».", "🎱 Определённо да.",
-    "🎱 Сомневаюсь.", "🎱 Знаки говорят «да».",
-    "🎱 Туманно, попробуй ещё раз.", "🎱 Да, но осторожно.",
-    "🎱 Лучше не спрашивай.", "🎱 Всё возможно в этом мире.",
-    "🎱 Судьба решит за тебя.", "🎱 Я бы на твоём месте подумал.",
-]
-
-# ==================== СЕРВИСНЫЕ СООБЩЕНИЯ ====================
-
-SERVICE_PATTERNS = [
-    re.compile(r".+\s+пригласил[а]?\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+invited\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+добавил[а]?\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+added\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+вступил[а]?\s+(в|к)\s+", re.IGNORECASE),
-    re.compile(r".+\s+присоединил(ся|ась)\s+", re.IGNORECASE),
-    re.compile(r".+\s+joined\s+(the\s+)?group", re.IGNORECASE),
-    re.compile(r".+\s+вышел\s+из\s+", re.IGNORECASE),
-    re.compile(r".+\s+вышла\s+из\s+", re.IGNORECASE),
-    re.compile(r".+\s+покинул[а]?\s+", re.IGNORECASE),
-    re.compile(r".+\s+left\s+(the\s+)?group", re.IGNORECASE),
-    re.compile(r".+\s+удалил[а]?\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+removed\s+.+", re.IGNORECASE),
-    re.compile(r".+\s+изменил[а]?\s+название", re.IGNORECASE),
-]
-
-
-def is_service_message(message: types.Message) -> bool:
-    if message.new_chat_members is not None:
-        return True
-    if message.left_chat_member is not None:
-        return True
-    for attr in (
-        "new_chat_title", "new_chat_photo", "delete_chat_photo",
-        "pinned_message", "group_chat_created", "supergroup_chat_created",
-        "channel_chat_created", "migrate_to_chat_id", "migrate_from_chat_id",
-        "video_chat_started", "video_chat_ended", "video_chat_scheduled",
-        "video_chat_participants_invited", "proximity_alert_triggered",
-        "forum_topic_created", "forum_topic_closed", "forum_topic_reopened",
-    ):
-        if getattr(message, attr, None) is not None:
-            return True
-
-    text = message.text or message.caption or ""
-    if text and len(text) <= 200:
-        for pattern in SERVICE_PATTERNS:
-            if pattern.search(text):
-                if "@" in text or text[0].isupper():
-                    return True
-
-    return False
-
-
-# ==================== КЭШ ПОЛЬЗОВАТЕЛЕЙ ====================
-
-def cache_user(chat_id: int, user: types.User):
-    if not user:
-        return
-    if user.username:
-        USERNAME_CACHE.setdefault(chat_id, {})[user.username.lower()] = user.id
-    USER_ID_TO_NAME[(chat_id, user.id)] = user.full_name
-
-
-def track_message(chat_id: int, user: types.User, is_bad: bool = False):
-    if not user or user.is_bot:
-        return
-    stats = USER_STATS.setdefault(chat_id, {})
-    now = datetime.now()
-
-    if user.id not in stats:
-        stats[user.id] = {
-            "messages": 0,
-            "bad_words": 0,
-            "first_seen": now,
-            "last_seen": now,
-            "name": user.full_name,
-            "username": user.username or "",
-        }
-
-    entry = stats[user.id]
-    entry["messages"] += 1
-    if is_bad:
-        entry["bad_words"] += 1
-    entry["last_seen"] = now
-    entry["name"] = user.full_name
-    entry["username"] = user.username or entry["username"]
-
-
-async def warm_cache(chat_id: int):
-    if chat_id in WARMED_CHATS:
-        return
-    WARMED_CHATS.add(chat_id)
     try:
-        admins = await bot.get_chat_administrators(chat_id)
-        for admin in admins:
-            if not admin.user.is_bot:
-                cache_user(chat_id, admin.user)
-    except Exception as e:
-        print(f"warm_cache({chat_id}): {e}")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def resolve_username(chat_id: int, username: str):
-    if not username:
-        return None
-    uname = username.lstrip("@").lower()
-    return USERNAME_CACHE.get(chat_id, {}).get(uname)
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            color TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            permissions TEXT NOT NULL DEFAULT '[]',
+            protected INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS user_roles (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+            PRIMARY KEY(user_id, role_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """)
+
+        roles = [
+            ("Владелец", "#e0b84c", 10000, ["*"], 1),
+            ("Администратор", "#e05252", 9000, ADMIN_PERMISSIONS, 1),
+            ("Участник", "#9aa0aa", 0, [], 1),
+        ]
+
+        for name, color, position, permissions, protected in roles:
+            conn.execute("""
+                INSERT OR IGNORE INTO roles
+                (name, color, position, permissions, protected)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                name,
+                color,
+                position,
+                json.dumps(permissions),
+                protected
+            ))
+
+        owner_role = conn.execute(
+            "SELECT id FROM roles WHERE name='Владелец'"
+        ).fetchone()["id"]
+
+        admin_role = conn.execute(
+            "SELECT id FROM roles WHERE name='Администратор'"
+        ).fetchone()["id"]
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn.execute("""
+            INSERT OR IGNORE INTO users
+            (id, username, first_name, last_seen)
+            VALUES (?, ?, ?, ?)
+        """, (OWNER_ID, None, "Владелец", now))
+
+        conn.execute("""
+            INSERT OR IGNORE INTO user_roles (user_id, role_id)
+            VALUES (?, ?)
+        """, (OWNER_ID, owner_role))
+
+        for admin_id in ADMIN_IDS:
+            conn.execute("""
+                INSERT OR IGNORE INTO users
+                (id, username, first_name, last_seen)
+                VALUES (?, ?, ?, ?)
+            """, (admin_id, None, "Администратор", now))
+
+            conn.execute("""
+                INSERT OR IGNORE INTO user_roles (user_id, role_id)
+                VALUES (?, ?)
+            """, (admin_id, admin_role))
 
 
-def get_name(chat_id: int, user_id: int) -> str:
-    return USER_ID_TO_NAME.get((chat_id, user_id), f"ID {user_id}")
+# ============================================================
+# TELEGRAM AUTHENTICATION
+# ============================================================
+
+def validate_init_data(init_data: str):
+    if not init_data:
+        raise web.HTTPUnauthorized(text="Откройте приложение через Telegram")
+
+    values = dict(parse_qsl(init_data, keep_blank_values=True))
+
+    received_hash = values.pop("hash", None)
+
+    if not received_hash:
+        raise web.HTTPUnauthorized(text="Нет подписи Telegram")
+
+    try:
+        auth_date = int(values.get("auth_date", "0"))
+    except ValueError:
+        raise web.HTTPUnauthorized(text="Неверная дата авторизации")
+
+    if abs(time.time() - auth_date) > 86400:
+        raise web.HTTPUnauthorized(text="Данные авторизации устарели")
+
+    data_check = "\n".join(
+        f"{key}={value}"
+        for key, value in sorted(values.items())
+    )
+
+    secret_key = hmac.new(
+        b"WebAppData",
+        BOT_TOKEN.encode(),
+        hashlib.sha256
+    ).digest()
+
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise web.HTTPUnauthorized(text="Ошибка проверки Telegram")
+
+    try:
+        user = json.loads(values.get("user", "{}"))
+    except json.JSONDecodeError:
+        raise web.HTTPUnauthorized(text="Ошибка данных пользователя")
+
+    if not user.get("id"):
+        raise web.HTTPUnauthorized(text="Пользователь не найден")
+
+    return user
 
 
-def extract_username_from_text(text: str):
-    if not text:
-        return None
-    m = re.search(r"@([A-Za-z0-9_]{4,32})", text)
-    return m.group(0) if m else None
+def get_identity(request):
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    return validate_init_data(init_data)
 
 
-def extract_user_id_from_text(text: str):
-    if not text:
-        return None
-    m = re.search(r"\b(\d{6,15})\b", text)
-    return int(m.group(1)) if m else None
+# ============================================================
+# USERS AND ROLES
+# ============================================================
+
+def ensure_user(user):
+    uid = int(user["id"])
+
+    with db() as conn:
+        now = datetime.now(timezone.utc).isoformat()
+
+        conn.execute("""
+            INSERT INTO users (id, username, first_name, last_seen)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_seen=excluded.last_seen
+        """, (
+            uid,
+            user.get("username"),
+            user.get("first_name") or "Пользователь",
+            now
+        ))
+
+        if uid == OWNER_ID:
+            role = conn.execute(
+                "SELECT id FROM roles WHERE name='Владелец'"
+            ).fetchone()
+
+        elif uid in ADMIN_IDS:
+            role = conn.execute(
+                "SELECT id FROM roles WHERE name='Администратор'"
+            ).fetchone()
+
+        else:
+            role = conn.execute(
+                "SELECT id FROM roles WHERE name='Участник'"
+            ).fetchone()
+
+        if role:
+            conn.execute("""
+                INSERT OR IGNORE INTO user_roles (user_id, role_id)
+                VALUES (?, ?)
+            """, (uid, role["id"]))
 
 
-async def resolve_target(message: types.Message):
-    chat_id = message.chat.id
+def get_permissions(conn, uid):
+    rows = conn.execute("""
+        SELECT r.permissions
+        FROM roles r
+        JOIN user_roles ur ON ur.role_id = r.id
+        WHERE ur.user_id = ?
+    """, (uid,)).fetchall()
 
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        cache_user(chat_id, u)
-        return u.id, u.full_name, None
+    permissions = set()
 
-    text = message.text or ""
+    for row in rows:
+        permissions.update(json.loads(row["permissions"]))
 
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "text_mention" and entity.user:
-                u = entity.user
-                cache_user(chat_id, u)
-                return u.id, u.full_name, None
-            if entity.type == "mention":
-                username = text[entity.offset:entity.offset + entity.length]
-                uid = resolve_username(chat_id, username)
-                if uid:
-                    return uid, get_name(chat_id, uid), None
-                return None, username, (
-                    f"❌ Не удалось найти <code>{username}</code>.\n"
-                    "Пользователь должен хоть раз написать в этом чате.\n"
-                    "Проверь кэш: /users\n"
-                    "Или используй reply / числовой ID."
-                )
+    return permissions
 
-    username = extract_username_from_text(text)
-    if username:
-        uid = resolve_username(chat_id, username)
-        if uid:
-            return uid, get_name(chat_id, uid), None
-        return None, username, (
-            f"❌ Не удалось найти <code>{username}</code> в кэше.\n"
-            "Проверь кэш: /users\n"
-            "Или используй reply / числовой ID."
+
+def has_permission(conn, uid, permission):
+    if uid == OWNER_ID:
+        return True
+
+    permissions = get_permissions(conn, uid)
+
+    return "*" in permissions or permission in permissions
+
+
+def require_permission(conn, uid, permission):
+    if not has_permission(conn, uid, permission):
+        raise web.HTTPForbidden(text="Недостаточно прав")
+
+
+def highest_position(conn, uid):
+    row = conn.execute("""
+        SELECT MAX(r.position) AS position
+        FROM roles r
+        JOIN user_roles ur ON ur.role_id = r.id
+        WHERE ur.user_id = ?
+    """, (uid,)).fetchone()
+
+    return row["position"] or 0
+
+
+def get_role(conn, role_id):
+    role = conn.execute(
+        "SELECT * FROM roles WHERE id = ?",
+        (role_id,)
+    ).fetchone()
+
+    if not role:
+        raise web.HTTPNotFound(text="Роль не найдена")
+
+    return role
+
+
+def check_role_hierarchy(conn, uid, role):
+    if uid == OWNER_ID:
+        return
+
+    if role["protected"]:
+        raise web.HTTPForbidden(
+            text="Стартовую роль может менять только владелец"
         )
 
-    uid = extract_user_id_from_text(text)
-    if uid:
-        return uid, f"ID {uid}", None
-
-    return None, None, (
-        "❌ Укажи пользователя:\n"
-        "• ответь (reply) на его сообщение\n"
-        "• укажи @username (см. /users)\n"
-        "• укажи числовой ID"
-    )
-
-
-# ==================== ПРОВЕРКА ПРАВ ====================
-
-def is_super_admin(message: types.Message) -> bool:
-    """Проверяет, входит ли автор в супер-админы."""
-    if not message.from_user:
-        return False
-    uname = (message.from_user.username or "").lower()
-    uid = message.from_user.id
-
-    if uname and uname in SUPER_ADMINS:
-        return True
-    if uid in SUPER_ADMIN_IDS:
-        return True
-    return False
-
-
-async def is_admin(message: types.Message) -> bool:
-    """Админ чата ИЛИ супер-админ из whitelist."""
-    if message.chat.type == ChatType.PRIVATE:
-        return True
-
-    # супер-админ — всегда True
-    if is_super_admin(message):
-        return True
-
-    # обычная проверка
-    try:
-        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        return member.status in ("administrator", "creator")
-    except Exception as e:
-        print(f"is_admin: {e}")
-        return False
-
-
-async def is_target_admin(message: types.Message, target_id: int) -> bool:
-    if message.chat.type == ChatType.PRIVATE:
-        return False
-    try:
-        member = await bot.get_chat_member(message.chat.id, target_id)
-        return member.status in ("administrator", "creator")
-    except Exception as e:
-        print(f"is_target_admin: {e}")
-        return False
-
-
-async def bot_can_restrict(message: types.Message) -> bool:
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(message.chat.id, me.id)
-        return bool(getattr(member, "can_restrict_members", False))
-    except Exception as e:
-        print(f"bot_can_restrict: {e}")
-        return False
-
-
-def parse_minutes(args):
-    for a in args[1:]:
-        if a.isdigit() and len(a) <= 5:
-            n = int(a)
-            if n > 0:
-                return n
-    return None
-
-
-async def check_target(message: types.Message, user_id: int, name: str) -> bool:
-    if user_id == BOT_ID:
-        await message.reply("🤖 Нельзя наказывать самого бота.")
-        return False
-
-    # защита супер-админов
-    for uname, cached_id in USERNAME_CACHE.get(message.chat.id, {}).items():
-        if cached_id == user_id and uname in SUPER_ADMINS:
-            await message.reply(
-                f"🛡 <b>{name}</b> — супер-админ. Его нельзя наказать."
-            )
-            return False
-    if user_id in SUPER_ADMIN_IDS:
-        await message.reply(
-            f"🛡 <b>{name}</b> — супер-админ. Его нельзя наказать."
-        )
-        return False
-
-    if await is_target_admin(message, user_id):
-        await message.reply(f"🛡 <b>{name}</b> — админ. Его нельзя наказать.")
-        return False
-    return True
-
-
-# ==================== СТАТИСТИКА ====================
-
-def human_delta(dt: datetime) -> str:
-    delta = datetime.now() - dt
-    seconds = int(delta.total_seconds())
-    if seconds < 60:
-        return f"{seconds} сек. назад"
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} мин. назад"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours} ч. назад"
-    days = hours // 24
-    if days < 30:
-        return f"{days} дн. назад"
-    months = days // 30
-    if months < 12:
-        return f"{months} мес. назад"
-    years = days // 365
-    return f"{years} г. назад"
-
-
-def human_date(dt: datetime) -> str:
-    return dt.strftime("%d.%m.%Y %H:%M")
-
-
-async def build_stats_message(message: types.Message, target_id, target_name):
-    chat_id = message.chat.id
-
-    if target_id is None:
-        target_id = message.from_user.id
-        target_name = message.from_user.full_name
-
-    display_name = get_name(chat_id, target_id) if target_id else (target_name or "—")
-    if target_id == message.from_user.id:
-        display_name = message.from_user.full_name
-
-    stats = USER_STATS.get(chat_id, {}).get(target_id)
-    if not stats:
-        return (
-            f"👤 <b>{display_name}</b>\n\n"
-            "📊 Нет данных — этот пользователь ещё не писал в чате "
-            "(статистика ведётся с момента запуска бота)."
+    if role["position"] >= highest_position(conn, uid):
+        raise web.HTTPForbidden(
+            text="Нельзя управлять ролью равного или более высокого уровня"
         )
 
-    username_line = f"🔗 @{stats['username']}" if stats["username"] else ""
-    total = stats["messages"]
-    bad = stats["bad_words"]
-    clean = total - bad
 
-    text = (
-        f"👤 <b>{stats['name']}</b>\n"
-        f"{username_line}\n"
-        f"🆔 <code>{target_id}</code>\n\n"
-        f"📊 <b>Статистика в этом чате:</b>\n"
-        f"• Всего сообщений: <b>{total}</b>\n"
-        f"• Чистых: <b>{clean}</b>\n"
-        f"• Нарушений (мат): <b>{bad}</b>\n\n"
-        f"🕐 Первое сообщение: {human_date(stats['first_seen'])}\n"
-        f"   ({human_delta(stats['first_seen'])})\n"
-        f"🕐 Последнее: {human_delta(stats['last_seen'])}"
-    )
-    return text
-
-
-@dp.message(Command("актив"))
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer(await build_stats_message(message, None, None))
-        return
-
-    user_id, name, err = await resolve_target(message)
-    if err and not message.reply_to_message:
-        args = (message.text or "").split()
-        if len(args) < 2:
-            user_id, name, err = None, None, None
-
-    if err:
-        await message.reply(err)
-        return
-
-    await message.answer(await build_stats_message(message, user_id, name))
-
-
-@dp.message(Command("whoareyou"))
-@dp.message(Command("ктоты"))
-async def cmd_whoareyou(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        await message.answer(await build_stats_message(message, None, None))
-        return
-
-    user_id, name, err = await resolve_target(message)
-    if err and not message.reply_to_message:
-        args = (message.text or "").split()
-        if len(args) < 2:
-            user_id, name, err = None, None, None
-
-    if err:
-        await message.reply(err)
-        return
-
-    await message.answer(await build_stats_message(message, user_id, name))
-
-
-# ==================== BUSINESS ====================
-
-BUSINESS_HELP_TEXT = (
-    "💼 <b>Business-бот — команды в личке</b>\n\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "<b>Мут собеседника</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "• <code>.мут</code> — удалять все сообщения собеседника\n"
-    "• Кнопка «🔊 Размутить» — снять мут\n\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "<b>Прочее</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "• <code>.хелп</code> или <code>.help</code> — этот список\n\n"
-    "⚠️ <i>Для мута нужно право «Удалять сообщения» в "
-    "Настройках Telegram Business → Чат-боты.</i>"
-)
-
-
-@dp.business_connection()
-async def on_business_connection(conn: BusinessConnection):
-    print(
-        f"\n=== BUSINESS CONNECTION ===\n"
-        f"id={conn.id}\n"
-        f"user_id={conn.user.id}\n"
-        f"enabled={conn.is_enabled}\n"
-        f"can_reply={getattr(conn, 'can_reply', None)}\n"
-        f"can_delete_all_messages={getattr(conn, 'can_delete_all_messages', None)}\n"
-    )
-
-    if conn.is_enabled:
-        BUSINESS_CONNECTIONS[conn.id] = {
-            "owner_id": conn.user.id,
-            "muted": set(),
-            "can_delete": bool(getattr(conn, "can_delete_all_messages", False)),
-        }
-    else:
-        BUSINESS_CONNECTIONS.pop(conn.id, None)
-
-
-async def get_business_conn(conn_id: str):
-    conn = BUSINESS_CONNECTIONS.get(conn_id)
-    if conn:
-        try:
-            bc = await bot.get_business_connection(conn_id)
-            conn["can_delete"] = bool(
-                getattr(bc, "can_delete_all_messages", False)
-            )
-            conn["owner_id"] = bc.user.id
-        except Exception as e:
-            print(f"get_business_conn refresh: {e}")
-        return conn
-
-    try:
-        bc = await bot.get_business_connection(conn_id)
-        conn = {
-            "owner_id": bc.user.id,
-            "muted": set(),
-            "can_delete": bool(getattr(bc, "can_delete_all_messages", False)),
-        }
-        BUSINESS_CONNECTIONS[conn_id] = conn
-        return conn
-    except Exception as e:
-        print(f"get_business_conn: {e}")
-        return None
-
-
-async def try_delete_business(conn_id: str, message_id: int) -> bool:
-    try:
-        await bot.delete_business_messages(
-            business_connection_id=conn_id,
-            message_ids=[message_id]
-        )
-        return True
-    except Exception as e:
-        print(f"delete_business_messages FAILED: {e}")
-        return False
-
-
-@dp.business_message()
-async def on_business_message(message: types.Message):
-    try:
-        conn_id = message.business_connection_id
-        user_id = message.from_user.id if message.from_user else None
-        text = (message.text or "").strip()
-        text_low = text.lower()
-
-        print(
-            f"\n=== BUSINESS MESSAGE ===\n"
-            f"conn_id={conn_id}\n"
-            f"user_id={user_id}\n"
-            f"chat_id={message.chat.id}\n"
-            f"text={text!r}\n"
-        )
-
-        if not conn_id:
-            return
-
-        conn = await get_business_conn(conn_id)
-        if not conn:
-            return
-
-        owner_id = conn["owner_id"]
-        is_from_owner = (user_id == owner_id)
-
-        if text_low in (".help", ".хелп"):
-            await try_delete_business(conn_id, message.message_id)
-            try:
-                await bot.send_message(
-                    chat_id=message.chat.id,
-                    text=BUSINESS_HELP_TEXT,
-                )
-            except Exception as e:
-                print(f"send .хелп FAILED: {e}")
-            return
-
-        if is_from_owner and text_low == ".мут":
-            target_id = message.chat.id
-            target_name = message.chat.full_name or "собеседник"
-
-            if target_id == owner_id:
-                try:
-                    await bot.send_message(
-                        chat_id=message.chat.id,
-                        text="❌ Нельзя замутить самого себя."
-                    )
-                except Exception:
-                    pass
-                return
-
-            if not conn.get("can_delete", False):
-                try:
-                    await bot.send_message(
-                        chat_id=message.chat.id,
-                        text=(
-                            "❌ <b>Не могу замутить собеседника.</b>\n\n"
-                            "У бота нет права <b>«Удалять сообщения»</b>.\n"
-                            "Без него я не смогу удалять сообщения собеседника.\n\n"
-                            "<b>Как включить:</b>\n"
-                            "1. Настройки Telegram → Telegram Business\n"
-                            "2. → Чат-боты → твой бот\n"
-                            "3. Включи право «Удалять сообщения»\n"
-                            "4. Перезапусти бота\n\n"
-                            "После этого напиши <code>.мут</code> снова."
-                        )
-                    )
-                except Exception as e:
-                    print(f"send warning FAILED: {e}")
-                await try_delete_business(conn_id, message.message_id)
-                return
-
-            conn["muted"].add(target_id)
-
-            await try_delete_business(conn_id, message.message_id)
-
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🔊 Размутить",
-                    callback_data=f"biz_unmute:{conn_id}:{target_id}"
-                )
-            ]])
-
-            try:
-                await bot.send_message(
-                    chat_id=message.chat.id,
-                    text=(
-                        f"🔇 Мут включён для <b>{target_name}</b>.\n"
-                        f"Теперь его сообщения будут удаляться."
-                    ),
-                    reply_markup=kb
-                )
-            except Exception as e:
-                print(f"send confirm FAILED: {e}")
-            return
-
-        if not is_from_owner and user_id in conn["muted"]:
-            ok = await try_delete_business(conn_id, message.message_id)
-            print(f"Удаление: {'OK' if ok else 'FAILED'}")
-            return
-
-    except Exception as e:
-        print(f"!!! on_business_message ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-@dp.callback_query(lambda c: c.data.startswith("biz_unmute:"))
-async def biz_unmute_callback(call: CallbackQuery):
-    try:
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            await call.answer("Ошибка.", show_alert=True)
-            return
-        _, conn_id, user_id_str = parts
-        try:
-            user_id = int(user_id_str)
-        except ValueError:
-            await call.answer("Ошибка.", show_alert=True)
-            return
-
-        conn = await get_business_conn(conn_id)
-        if not conn:
-            await call.answer("Соединение неактивно.", show_alert=True)
-            return
-
-        if call.from_user.id != conn["owner_id"]:
-            await call.answer("Размутить может только владелец.", show_alert=True)
-            return
-
-        conn["muted"].discard(user_id)
-        try:
-            await call.message.edit_text(
-                "🔊 Пользователь размучен. Сообщения больше не удаляются."
-            )
-        except Exception:
-            pass
-        await call.answer("Готово")
-    except Exception as e:
-        print(f"biz_unmute error: {e}")
-        await call.answer("Ошибка.", show_alert=True)
-
-
-# ==================== УПРАВЛЕНИЕ СУПЕР-АДМИНАМИ ====================
-
-@dp.message(Command("addsuper"))
-async def cmd_addsuper(message: types.Message):
-    if not is_super_admin(message):
-        await message.reply("❌ Только супер-админы могут менять whitelist.")
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.reply("❌ Формат: <code>/addsuper @username</code>")
-        return
-    uname = parts[1].lstrip("@").lower()
-    SUPER_ADMINS.add(uname)
-    await message.reply(f"✅ <code>@{uname}</code> добавлен в супер-админы.")
-
-
-@dp.message(Command("delsuper"))
-async def cmd_delsuper(message: types.Message):
-    if not is_super_admin(message):
-        await message.reply("❌ Только супер-админы могут менять whitelist.")
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.reply("❌ Формат: <code>/delsuper @username</code>")
-        return
-    uname = parts[1].lstrip("@").lower()
-    SUPER_ADMINS.discard(uname)
-    await message.reply(f"✅ <code>@{uname}</code> удалён из супер-админов.")
-
-
-@dp.message(Command("superlist"))
-async def cmd_superlist(message: types.Message):
-    if not is_super_admin(message):
-        await message.reply("❌ Только для супер-админов.")
-        return
-    if not SUPER_ADMINS:
-        await message.answer("📋 Список пуст.")
-        return
-    text = "📋 <b>Супер-админы:</b>\n" + "\n".join(
-        f"• @{u}" for u in sorted(SUPER_ADMINS)
-    )
-    await message.answer(text)
-
-
-# ==================== КОМАНДЫ ====================
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    cache_user(message.chat.id, message.from_user)
-    await message.answer(
-        "👋 Привет! Я бот-цензор.\n\n"
-        "🛡 Удаляю мат автоматически\n"
-        "🧹 Чищу сервисные сообщения\n"
-        "📢 Созываю всех через /everyone\n"
-        "🎲 Развлекательные команды\n"
-        "🔨 Модерация\n"
-        "🔠 Защита от капслока\n"
-        "🔗 Защита от ссылок (кроме youtube.com/shorts)\n\n"
-        "💼 Если я подключён к твоему Business-аккаунту, "
-        "напиши мне в личку <code>.мут</code> или <code>.хелп</code>.\n\n"
-        "📌 /help для списка команд."
-    )
-
-
-@dp.message(Command("help"))
-@dp.message(Command("помощь"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "🛡 <b>Бот-цензор</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🎲 <b>Развлечения (для всех):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "• /rps — КНБ с ботом\n"
-        "• /rps @user или reply — КНБ с участником (с его согласия)\n"
-        "• /dice — бросить кубик (1–6)\n"
-        "• /coin — орёл или решка\n"
-        "• /ball &lt;вопрос&gt; — магический шар\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 <b>Статистика:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "• /актив или /stats — статистика пользователя\n"
-        "• /whoareyou или «кто ты» — то же самое\n"
-        "• Работает: reply, @username, без аргументов (про себя)\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📢 <b>Общее:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "• /everyone — созвать всех участников\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "💼 <b>Business-режим (в личке):</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "• <code>.мут</code> — удалять сообщения собеседника\n"
-        "• <code>.хелп</code> / <code>.help</code> — список команд\n"
-        "• кнопка «🔊 Размутить» — снять мут\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔨 <b>Администрация:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "<b>Удаление:</b>\n"
-        "• /delete — удалить сообщение (reply)\n\n"
-        "<b>Наказания:</b>\n"
-        "• /kick — кикнуть (@user или reply)\n"
-        "• /ban — забанить навсегда\n"
-        "• /unban — разбанить (@user или ID)\n"
-        "• /tempban &lt;мин&gt; — временный бан\n"
-        "• /mute &lt;мин&gt; — мут (заглушить)\n"
-        "• /vmute &lt;мин&gt; — мут голосовых\n"
-        "• /unmute — снять все муты\n"
-        "• /users — кого бот знает (для @username)\n\n"
-        "<b>Супер-админы:</b>\n"
-        "• /addsuper @user — добавить в whitelist\n"
-        "• /delsuper @user — убрать из whitelist\n"
-        "• /superlist — список супер-админов\n\n"
-        "<b>Управление ботом:</b>\n"
-        "• /censor — включить цензуру\n"
-        "• /uncensor — выключить цензуру\n"
-        "• /censor_status — статус цензуры\n"
-        "• /caps — включить защиту от капслока\n"
-        "• /uncaps — выключить защиту от капслока\n"
-        "• /caps_status — статус защиты от капслока\n"
-        "• /links — включить защиту от ссылок\n"
-        "• /unlinks — выключить защиту от ссылок\n"
-        "• /links_status — статус защиты от ссылок\n"
-        "• /service_on — вкл. чистку сервисных\n"
-        "• /service_off — выкл. чистку\n"
-        "• /service_status — статус чистки\n\n"
-        "💡 <i>Команды администрации доступны админам чата. "
-        "Отдельные пользователи из whitelist могут использовать их без прав.</i>\n\n"
-        "🔗 <i>Защита от ссылок не блокирует https://www.youtube.com/shorts</i>"
-    )
-
-
-@dp.message(Command("censor"))
-async def cmd_censor_on(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    CENSOR_ENABLED[message.chat.id] = True
-    await message.answer("✅ Цензура включена.")
-
-
-@dp.message(Command("uncensor"))
-async def cmd_censor_off(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    CENSOR_ENABLED[message.chat.id] = False
-    await message.answer("🔓 Цензура выключена.")
-
-
-@dp.message(Command("censor_status"))
-async def cmd_censor_status(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    status = CENSOR_ENABLED.get(message.chat.id, True)
-    await message.answer(f"Цензура: {'✅ вкл' if status else '🔓 выкл'}")
-
-
-@dp.message(Command("caps"))
-async def cmd_caps_on(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    CAPS_ENABLED[message.chat.id] = True
-    await message.answer("✅ Защита от капслока включена.")
-
-
-@dp.message(Command("uncaps"))
-async def cmd_caps_off(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    CAPS_ENABLED[message.chat.id] = False
-    await message.answer("🔓 Защита от капслока выключена.")
-
-
-@dp.message(Command("caps_status"))
-async def cmd_caps_status(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    status = CAPS_ENABLED.get(message.chat.id, False)
-    await message.answer(f"Защита от капслока: {'✅ вкл' if status else '🔓 выкл'}")
-
-
-@dp.message(Command("links"))
-async def cmd_links_on(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    LINKS_ENABLED[message.chat.id] = True
-    await message.answer("✅ Защита от ссылок включена (кроме youtube.com/shorts).")
-
-
-@dp.message(Command("unlinks"))
-async def cmd_links_off(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    LINKS_ENABLED[message.chat.id] = False
-    await message.answer("🔓 Защита от ссылок выключена.")
-
-
-@dp.message(Command("links_status"))
-async def cmd_links_status(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    status = LINKS_ENABLED.get(message.chat.id, False)
-    await message.answer(f"Защита от ссылок: {'✅ вкл' if status else '🔓 выкл'}")
-
-
-@dp.message(Command("service_on"))
-async def cmd_service_on(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        return
-    SERVICE_CLEANER_ENABLED[message.chat.id] = True
-    await message.answer("✅ Чистка сервисных включена.")
-
-
-@dp.message(Command("service_off"))
-async def cmd_service_off(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        return
-    SERVICE_CLEANER_ENABLED[message.chat.id] = False
-    await message.answer("🔓 Чистка сервисных выключена.")
-
-
-@dp.message(Command("service_status"))
-async def cmd_service_status(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    status = SERVICE_CLEANER_ENABLED.get(message.chat.id, True)
-    await message.answer(f"Чистка сервисных: {'✅ вкл' if status else '🔓 выкл'}")
-
-
-@dp.message(Command("users"))
-async def cmd_users(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-
-    await warm_cache(message.chat.id)
-    cache = USERNAME_CACHE.get(message.chat.id, {})
-    if not cache:
-        await message.answer("👥 Кэш пуст. Пока никто не писал в чате.")
-        return
-
-    lines = []
-    for uname, uid in sorted(cache.items()):
-        name = get_name(message.chat.id, uid)
-        lines.append(f"• @{uname} — {name}")
-    text = "👥 <b>Кэш пользователей:</b>\n\n" + "\n".join(lines[:60])
-    if len(lines) > 60:
-        text += f"\n\n…и ещё {len(lines) - 60}"
-    await message.answer(text)
-
-
-@dp.message(Command("everyone"))
-@dp.message(Command("все"))
-async def cmd_everyone(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        await message.reply("❌ Только админы могут созывать всех.")
-        return
-
-    await warm_cache(message.chat.id)
-    chat_id = message.chat.id
-    user_ids = set()
-
-    cached = USERNAME_CACHE.get(chat_id, {})
-    for uid in cached.values():
-        user_ids.add(uid)
-
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-        for admin in admins:
-            if not admin.user.is_bot:
-                user_ids.add(admin.user.id)
-    except Exception as e:
-        print(f"get_chat_administrators: {e}")
-
-    user_ids.add(message.from_user.id)
-
-    real_ids = []
-    for uid in user_ids:
-        try:
-            member = await bot.get_chat_member(chat_id, uid)
-            if member.user.is_bot:
-                continue
-            if member.status in ("left", "kicked"):
-                continue
-            real_ids.append(uid)
-        except Exception:
-            continue
-
-    if not real_ids:
-        await message.answer("⚠️ Не удалось собрать участников.")
-        return
-
-    mentions = " ".join(
-        f'<a href="tg://user?id={uid}">\u200b</a>' for uid in real_ids[:40]
-    )
-
-    text = (
-        "📢 <b>Внимание всем!</b>\n"
-        f"{mentions}\n"
-        f"🔔 {message.from_user.mention_html()} созывает всех!"
-    )
-
-    try:
-        await message.answer(text)
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("delete"))
-async def cmd_delete(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        return
-    if not await is_admin(message):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
-    if not message.reply_to_message:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        return
-    try:
-        await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
-    except Exception as e:
-        print(f"delete target: {e}")
-    try:
-        await message.delete()
-    except Exception as e:
-        print(f"delete cmd: {e}")
-
-
-# ==================== КНБ ====================
-
-RPS_CHOICES = {"rock": "✊ Камень", "scissors": "✌️ Ножницы", "paper": "✋ Бумага"}
-RPS_BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
-
-
-def rps_result(a, b):
-    if a == b:
-        return "draw"
-    if RPS_BEATS[a] == b:
-        return "a"
-    return "b"
-
-
-def rps_keyboard(game_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✊", callback_data=f"rps:{game_id}:rock"),
-        InlineKeyboardButton(text="✌️", callback_data=f"rps:{game_id}:scissors"),
-        InlineKeyboardButton(text="✋", callback_data=f"rps:{game_id}:paper"),
-    ]])
-
-
-def rps_invite_keyboard(invite_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"rpsi:{invite_id}:yes"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rpsi:{invite_id}:no"),
-    ]])
-
-
-def make_game_id(chat_id, user_id):
-    return f"{chat_id}_{user_id}_{random.randint(100000, 999999)}"
-
-
-@dp.message(Command("rps"))
-@dp.message(Command("кнб"))
-async def cmd_rps(message: types.Message):
-    if message.chat.type == ChatType.PRIVATE:
-        await message.reply("❌ Только в группах.")
-        return
-
-    cache_user(message.chat.id, message.from_user)
-    target_id, target_name = await resolve_target_for_rps(message)
-
-    if target_id is None:
-        game_id = make_game_id(message.chat.id, message.from_user.id)
-        bot_choice_key = random.choice(list(RPS_CHOICES.keys()))
-        RPS_GAMES[game_id] = {
-            "player_a": message.from_user.id,
-            "player_b": BOT_ID,
-            "choice_a": None,
-            "choice_b": bot_choice_key,
-            "turn": "a",
-            "is_bot": True,
-            "a_name": message.from_user.full_name,
-            "a_mention": message.from_user.mention_html(),
-            "b_name": "🤖 Бот",
-            "b_mention": "🤖 Бот",
-            "chat_id": message.chat.id,
-        }
-        await message.answer(
-            f"🎮 <b>КНБ с ботом</b>\n\n"
-            f"👤 {message.from_user.mention_html()}, твой ход:",
-            reply_markup=rps_keyboard(game_id)
-        )
-        return
-
-    if target_id == message.from_user.id:
-        await message.reply("❌ Нельзя играть с самим собой.")
-        return
-
-    if target_id == BOT_ID:
-        await message.reply("🤖 Чтобы сыграть со мной, напиши /rps без аргументов.")
-        return
-
-    invite_id = f"{message.chat.id}_{random.randint(1000000, 9999999)}"
-    RPS_INVITES[invite_id] = {
-        "chat_id": message.chat.id,
-        "from_id": message.from_user.id,
-        "from_name": message.from_user.full_name,
-        "from_mention": message.from_user.mention_html(),
-        "to_id": target_id,
-        "to_name": target_name,
+def serialize_role(role):
+    return {
+        "id": role["id"],
+        "name": role["name"],
+        "color": role["color"],
+        "position": role["position"],
+        "permissions": json.loads(role["permissions"]),
+        "protected": bool(role["protected"])
     }
 
-    try:
-        await message.answer(
-            f"🎮 <b>Вызов на КНБ!</b>\n\n"
-            f"👤 {message.from_user.mention_html()} приглашает "
-            f"<a href=\"tg://user?id={target_id}\">{target_name}</a>\n\n"
-            f"Ожидаю ответа...",
-            reply_markup=rps_invite_keyboard(invite_id)
-        )
-    except Exception as e:
-        await message.reply(f"❌ {e}")
 
+# ============================================================
+# CHAT STATE
+# ============================================================
 
-async def resolve_target_for_rps(message: types.Message):
-    chat_id = message.chat.id
+def get_state(uid):
+    with db() as conn:
+        roles = conn.execute("""
+            SELECT * FROM roles
+            ORDER BY position DESC, id ASC
+        """).fetchall()
 
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        cache_user(chat_id, u)
-        return u.id, u.full_name
+        users = conn.execute("""
+            SELECT id, username, first_name
+            FROM users
+            ORDER BY first_name
+        """).fetchall()
 
-    text = message.text or ""
+        memberships = {}
 
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "text_mention" and entity.user:
-                u = entity.user
-                cache_user(chat_id, u)
-                return u.id, u.full_name
-            if entity.type == "mention":
-                username = text[entity.offset:entity.offset + entity.length]
-                uid = resolve_username(chat_id, username)
-                if uid:
-                    return uid, get_name(chat_id, uid)
-                return None, None
+        for row in conn.execute(
+            "SELECT user_id, role_id FROM user_roles"
+        ):
+            memberships.setdefault(str(row["user_id"]), []).append(
+                row["role_id"]
+            )
 
-    username = extract_username_from_text(text)
-    if username:
-        uid = resolve_username(chat_id, username)
-        if uid:
-            return uid, get_name(chat_id, uid)
+        messages = conn.execute("""
+            SELECT
+                m.id,
+                m.user_id,
+                m.text,
+                m.created_at,
+                u.first_name,
+                u.username
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.user_id
+            ORDER BY m.id DESC
+            LIMIT 100
+        """).fetchall()
 
-    return None, None
+        messages = list(reversed(messages))
 
+        permissions = get_permissions(conn, uid)
 
-@dp.callback_query()
-async def rps_callback(call: CallbackQuery):
-    if call.data.startswith("rpsi:"):
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            await call.answer("Ошибка.", show_alert=True)
-            return
-        _, invite_id, action = parts
-        invite = RPS_INVITES.get(invite_id)
-        if not invite:
-            await call.answer("Приглашение не найдено.", show_alert=True)
-            return
+        return {
+            "me": {
+                "id": uid,
+                "is_owner": uid == OWNER_ID,
+                "permissions": sorted(permissions),
+                "highest_position": highest_position(conn, uid)
+            },
 
-        if call.from_user.id != invite["to_id"]:
-            await call.answer("Это приглашение не тебе.", show_alert=True)
-            return
+            "roles": [
+                serialize_role(role)
+                for role in roles
+            ],
 
-        if action == "no":
-            try:
-                await call.message.edit_text(
-                    f"🎮 <b>КНБ</b>\n\n"
-                    f"❌ <a href=\"tg://user?id={invite['to_id']}\">{invite['to_name']}</a> "
-                    f"отклонил приглашение от {invite['from_mention']}.",
-                    reply_markup=None
-                )
-            except Exception:
-                pass
-            await call.answer("Отклонено.")
-            RPS_INVITES.pop(invite_id, None)
-            return
+            "users": [
+                {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "first_name": user["first_name"],
+                    "role_ids": memberships.get(str(user["id"]), [])
+                }
+                for user in users
+            ],
 
-        await call.answer("Принято!")
-        game_id = make_game_id(invite["chat_id"], invite["from_id"])
-        RPS_GAMES[game_id] = {
-            "player_a": invite["from_id"],
-            "player_b": invite["to_id"],
-            "choice_a": None,
-            "choice_b": None,
-            "turn": "a",
-            "is_bot": False,
-            "a_name": invite["from_name"],
-            "a_mention": invite["from_mention"],
-            "b_name": invite["to_name"],
-            "b_mention": f'<a href="tg://user?id={invite["to_id"]}">{invite["to_name"]}</a>',
-            "chat_id": invite["chat_id"],
+            "messages": [
+                {
+                    "id": message["id"],
+                    "user_id": message["user_id"],
+                    "name": (
+                        message["first_name"]
+                        or message["username"]
+                        or "Пользователь"
+                    ),
+                    "text": message["text"],
+                    "created_at": message["created_at"]
+                }
+                for message in messages
+            ]
         }
+
+
+# ============================================================
+# REQUEST HELPERS
+# ============================================================
+
+async def read_json(request):
+    try:
+        return await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text="Неверный JSON")
+
+
+def authenticated_user(request):
+    user = get_identity(request)
+    ensure_user(user)
+    return int(user["id"])
+
+
+# ============================================================
+# AUTH API
+# ============================================================
+
+async def api_auth(request):
+    data = await read_json(request)
+
+    user = validate_init_data(data.get("init_data", ""))
+
+    ensure_user(user)
+
+    return web.json_response(get_state(int(user["id"])))
+
+
+async def api_state(request):
+    uid = authenticated_user(request)
+
+    return web.json_response(get_state(uid))
+
+
+# ============================================================
+# MESSAGES API
+# ============================================================
+
+def extract_role_mentions(text):
+    return re.findall(r"@\[([^\]]+)\]", text)
+
+
+async def api_send_message(request):
+    uid = authenticated_user(request)
+
+    data = await read_json(request)
+
+    text = str(data.get("text", "")).strip()
+
+    if not text:
+        raise web.HTTPBadRequest(text="Сообщение пустое")
+
+    if len(text) > 2000:
+        raise web.HTTPBadRequest(text="Сообщение слишком длинное")
+
+    mentions = extract_role_mentions(text)
+
+    with db() as conn:
+        if mentions:
+            require_permission(conn, uid, "mention_roles")
+
+        user = conn.execute(
+            "SELECT first_name FROM users WHERE id = ?",
+            (uid,)
+        ).fetchone()
+
+        if not user:
+            raise web.HTTPUnauthorized(text="Пользователь не найден")
+
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        cursor = conn.execute("""
+            INSERT INTO messages (user_id, text, created_at)
+            VALUES (?, ?, ?)
+        """, (uid, text, created_at))
+
+        message_id = cursor.lastrowid
+
+        targets = set()
+
+        for role_name in mentions:
+            role = conn.execute("""
+                SELECT id FROM roles
+                WHERE lower(name) = lower(?)
+            """, (role_name,)).fetchone()
+
+            if not role:
+                continue
+
+            members = conn.execute("""
+                SELECT user_id
+                FROM user_roles
+                WHERE role_id = ?
+            """, (role["id"],)).fetchall()
+
+            for member in members:
+                if member["user_id"] != uid:
+                    targets.add(member["user_id"])
+
+    # Telegram bot notifications for role mentions.
+    for target_id in targets:
         try:
-            await call.message.edit_text(
-                f"🎮 <b>КНБ!</b>\n\n"
-                f"🥊 {invite['from_mention']} vs "
-                f"<a href=\"tg://user?id={invite['to_id']}\">{invite['to_name']}</a>\n\n"
-                f"👉 <b>{invite['from_name']}</b>, выбери свой ход первым:",
-                reply_markup=rps_keyboard(game_id)
+            await bot.send_message(
+                target_id,
+                f"🔔 Вас упомянули в TELEGRAMM CHAT:\n\n{text}"
             )
         except Exception:
             pass
-        RPS_INVITES.pop(invite_id, None)
-        return
 
-    if call.data.startswith("rps:"):
-        parts = call.data.split(":")
-        if len(parts) != 3:
-            await call.answer("Ошибка.", show_alert=True)
-            return
+    return web.json_response({
+        "id": message_id,
+        "user_id": uid,
+        "name": user["first_name"],
+        "text": text,
+        "created_at": created_at
+    })
 
-        _, game_id, choice = parts
-        game = RPS_GAMES.get(game_id)
-        if not game:
-            await call.answer("Игра завершена.", show_alert=True)
-            try:
-                await call.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            return
 
-        user_id = call.from_user.id
+# ============================================================
+# ROLE CREATION AND EDITING
+# ============================================================
 
-        if game["is_bot"]:
-            if user_id != game["player_a"]:
-                await call.answer("Не твоя игра.", show_alert=True)
-                return
-            bot_choice = game["choice_b"]
-            result = rps_result(choice, bot_choice)
-            if result == "draw":
-                verdict = "🤝 Ничья!"
-            elif result == "a":
-                verdict = f"🎉 Победил {game['a_name']}!"
-            else:
-                verdict = "😢 Победил бот!"
-            try:
-                await call.message.edit_text(
-                    f"🎮 <b>КНБ</b>\n\n"
-                    f"👤 {RPS_CHOICES[choice]}\n🤖 {RPS_CHOICES[bot_choice]}\n\n"
-                    f"<b>{verdict}</b>",
-                    reply_markup=None
+def validate_role_data(data):
+    name = str(data.get("name", "")).strip()
+    color = str(data.get("color", "#5865f2"))
+    position = data.get("position", 1)
+    permissions = data.get("permissions", [])
+
+    if len(name) < 2 or len(name) > 32:
+        raise web.HTTPBadRequest(text="Название роли: от 2 до 32 символов")
+
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        raise web.HTTPBadRequest(text="Неверный цвет")
+
+    try:
+        position = int(position)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(text="Неверная позиция роли")
+
+    if position < 1 or position > 8999:
+        raise web.HTTPBadRequest(text="Позиция должна быть от 1 до 8999")
+
+    if not isinstance(permissions, list):
+        raise web.HTTPBadRequest(text="Неверный список прав")
+
+    if not set(permissions).issubset(PERMISSIONS):
+        raise web.HTTPBadRequest(text="Неизвестное разрешение")
+
+    return name, color, position, permissions
+
+
+async def api_create_role(request):
+    uid = authenticated_user(request)
+    data = await read_json(request)
+
+    name, color, position, permissions = validate_role_data(data)
+
+    with db() as conn:
+        require_permission(conn, uid, "manage_roles")
+
+        if uid != OWNER_ID:
+            if position >= highest_position(conn, uid):
+                raise web.HTTPForbidden(
+                    text="Нельзя создать роль на своём или более высоком уровне"
                 )
-            except Exception:
-                pass
-            await call.answer()
-            RPS_GAMES.pop(game_id, None)
-            return
 
-        slot = "a" if user_id == game["player_a"] else ("b" if user_id == game["player_b"] else None)
-        if slot is None:
-            await call.answer("Не участник.", show_alert=True)
-            return
-
-        if game["turn"] != slot:
-            await call.answer("Сейчас не твой ход!", show_alert=True)
-            return
-
-        if game.get(f"choice_{slot}") is not None:
-            await call.answer("Уже выбрал!", show_alert=True)
-            return
-
-        game[f"choice_{slot}"] = choice
-        await call.answer(f"Выбрал: {RPS_CHOICES[choice]}")
-
-        if game["choice_a"] is not None and game["choice_b"] is not None:
-            ca, cb = game["choice_a"], game["choice_b"]
-            result = rps_result(ca, cb)
-            if result == "draw":
-                verdict = "🤝 Ничья!"
-            elif result == "a":
-                verdict = f"🏆 Победил {game['a_mention']}!"
-            else:
-                verdict = f"🏆 Победил {game['b_mention']}!"
-            try:
-                await call.message.edit_text(
-                    f"🎮 <b>КНБ результат</b>\n\n"
-                    f"👤 {game['a_mention']}: {RPS_CHOICES[ca]}\n"
-                    f"👤 {game['b_mention']}: {RPS_CHOICES[cb]}\n\n"
-                    f"<b>{verdict}</b>",
-                    reply_markup=None
+            if not set(permissions).issubset(get_permissions(conn, uid)):
+                raise web.HTTPForbidden(
+                    text="Нельзя выдавать права, которых у вас нет"
                 )
-            except Exception:
-                pass
-            RPS_GAMES.pop(game_id, None)
-            return
-
-        if slot == "a":
-            game["turn"] = "b"
-            next_mention = game["b_mention"]
-        else:
-            game["turn"] = "a"
-            next_mention = game["a_mention"]
 
         try:
-            await call.message.edit_text(
-                f"🎮 <b>КНБ</b>\n\n"
-                f"🥊 {game['a_mention']} vs {game['b_mention']}\n\n"
-                f"👉 Теперь ход: {next_mention}",
-                reply_markup=rps_keyboard(game_id)
+            conn.execute("""
+                INSERT INTO roles
+                (name, color, position, permissions)
+                VALUES (?, ?, ?, ?)
+            """, (
+                name,
+                color,
+                position,
+                json.dumps(permissions)
+            ))
+        except sqlite3.IntegrityError:
+            raise web.HTTPConflict(
+                text="Роль с таким названием уже существует"
             )
-        except Exception:
-            pass
-        return
 
-    await call.answer()
+    return web.json_response(get_state(uid))
 
 
-# ==================== РАЗВЛЕКАТЕЛЬНЫЕ ====================
+async def api_edit_role(request):
+    uid = authenticated_user(request)
+    role_id = int(request.match_info["role_id"])
 
-@dp.message(Command("dice"))
-@dp.message(Command("кубик"))
-async def cmd_dice(message: types.Message):
-    await message.answer(f"🎲 Выпало: <b>{random.randint(1, 6)}</b>")
+    data = await read_json(request)
 
+    name, color, position, permissions = validate_role_data(data)
 
-@dp.message(Command("coin"))
-@dp.message(Command("монетка"))
-async def cmd_coin(message: types.Message):
-    await message.answer(f"Подбрасываю... <b>{random.choice(['🪙 Орёл', '🪙 Решка'])}</b>")
+    with db() as conn:
+        require_permission(conn, uid, "manage_roles")
 
+        role = get_role(conn, role_id)
 
-@dp.message(Command("ball"))
-@dp.message(Command("шар"))
-async def cmd_ball(message: types.Message):
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("🔮 Задай вопрос: <code>/ball Вопрос?</code>")
-        return
-    await message.answer(f"❓ <i>{parts[1].strip()}</i>\n\n{random.choice(MAGIC_8_BALL)}")
+        check_role_hierarchy(conn, uid, role)
 
+        if uid != OWNER_ID:
+            if position >= highest_position(conn, uid):
+                raise web.HTTPForbidden(
+                    text="Нельзя переместить роль на свой или более высокий уровень"
+                )
 
-# ==================== МОДЕРАЦИЯ ====================
+            if not set(permissions).issubset(get_permissions(conn, uid)):
+                raise web.HTTPForbidden(
+                    text="Нельзя выдавать права, которых у вас нет"
+                )
 
-@dp.message(Command("kick"))
-async def cmd_kick(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав на ограничение.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    if not await check_target(message, user_id, name):
-        return
-    try:
-        await bot.ban_chat_member(message.chat.id, user_id)
-        await bot.unban_chat_member(message.chat.id, user_id)
-        await message.answer(f"👢 {name} кикнут.")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("ban"))
-async def cmd_ban(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    if not await check_target(message, user_id, name):
-        return
-    try:
-        await bot.ban_chat_member(message.chat.id, user_id)
-        await message.answer(f"🔨 {name} забанен.")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    try:
-        await bot.unban_chat_member(message.chat.id, user_id, only_if_banned=True)
-        await message.answer(f"🔓 {name} разбанен.")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("tempban"))
-async def cmd_tempban(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    if not await check_target(message, user_id, name):
-        return
-    minutes = parse_minutes((message.text or "").split())
-    if not minutes:
-        await message.reply("❌ Укажи минуты: /tempban 30")
-        return
-    try:
-        until_ts = int((datetime.now() + timedelta(minutes=minutes)).timestamp())
-        await bot.ban_chat_member(message.chat.id, user_id, until_date=until_ts)
-        await message.answer(f"⏱ {name} забанен на <b>{minutes} мин.</b>")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("mute"))
-async def cmd_mute(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    if not await check_target(message, user_id, name):
-        return
-    minutes = parse_minutes((message.text or "").split())
-    if not minutes:
-        await message.reply("❌ Укажи минуты: /mute @user 15")
-        return
-    try:
-        until_ts = int((datetime.now() + timedelta(minutes=minutes)).timestamp())
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=user_id,
-            permissions=types.ChatPermissions(can_send_messages=False),
-            until_date=until_ts
-        )
-        await message.answer(f"🔇 {name} замучен на <b>{minutes} мин.</b>")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("vmute"))
-async def cmd_vmute(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    if not await bot_can_restrict(message):
-        await message.reply("❌ Нет прав.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    if not await check_target(message, user_id, name):
-        return
-    minutes = parse_minutes((message.text or "").split())
-    if not minutes:
-        await message.reply("❌ Укажи минуты: /vmute @user 15")
-        return
-    try:
-        until_ts = int((datetime.now() + timedelta(minutes=minutes)).timestamp())
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=user_id,
-            permissions=types.ChatPermissions(
-                can_send_messages=True,
-                can_send_audios=False,
-                can_send_documents=False,
-                can_send_photos=False,
-                can_send_videos=False,
-                can_send_video_notes=False,
-                can_send_voice_notes=False,
-                can_send_polls=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False,
-                can_change_info=False,
-                can_invite_users=False,
-                can_pin_messages=False,
-            ),
-            until_date=until_ts
-        )
-        await message.answer(f"🎙 {name} — мут голосовых на <b>{minutes} мин.</b>")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
-
-
-@dp.message(Command("unmute"))
-async def cmd_unmute(message: types.Message):
-    if not await is_admin(message):
-        await message.reply("❌ Только админы.")
-        return
-    user_id, name, err = await resolve_target(message)
-    if err:
-        await message.reply(err)
-        return
-    try:
-        await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=user_id,
-            permissions=types.ChatPermissions(
-                can_send_messages=True,
-                can_send_audios=True,
-                can_send_documents=True,
-                can_send_photos=True,
-                can_send_videos=True,
-                can_send_video_notes=True,
-                can_send_voice_notes=True,
-                can_send_polls=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-                can_change_info=False,
-                can_invite_users=True,
-                can_pin_messages=False,
+        try:
+            conn.execute("""
+                UPDATE roles
+                SET name = ?,
+                    color = ?,
+                    position = ?,
+                    permissions = ?
+                WHERE id = ?
+            """, (
+                name,
+                color,
+                position,
+                json.dumps(permissions),
+                role_id
+            ))
+        except sqlite3.IntegrityError:
+            raise web.HTTPConflict(
+                text="Роль с таким названием уже существует"
             )
+
+    return web.json_response(get_state(uid))
+
+
+async def api_delete_role(request):
+    uid = authenticated_user(request)
+    role_id = int(request.match_info["role_id"])
+
+    with db() as conn:
+        require_permission(conn, uid, "manage_roles")
+
+        role = get_role(conn, role_id)
+
+        check_role_hierarchy(conn, uid, role)
+
+        if role["protected"]:
+            raise web.HTTPForbidden(
+                text="Стартовые роли нельзя удалить"
+            )
+
+        conn.execute(
+            "DELETE FROM roles WHERE id = ?",
+            (role_id,)
         )
-        await message.answer(f"🔊 {name} размучен (все права возвращены).")
-    except Exception as e:
-        await message.reply(f"❌ {e}")
+
+    return web.json_response(get_state(uid))
 
 
-# ==================== ОБЩИЙ ФИЛЬТР ====================
+# ============================================================
+# ROLE ASSIGNMENT
+# ============================================================
 
-@dp.message()
-async def filter_messages(message: types.Message):
-    if message.business_connection_id:
-        return
+async def api_assign_role(request):
+    uid = authenticated_user(request)
+    data = await read_json(request)
 
-    if message.from_user:
-        cache_user(message.chat.id, message.from_user)
-    if message.reply_to_message and message.reply_to_message.from_user:
-        cache_user(message.chat.id, message.reply_to_message.from_user)
-    if message.new_chat_members:
-        for u in message.new_chat_members:
-            cache_user(message.chat.id, u)
-
-    if SERVICE_CLEANER_ENABLED.get(message.chat.id, True) and is_service_message(message):
-        try:
-            await message.delete()
-        except Exception as e:
-            print(f"Не удалил сервисное: {e}")
-        return
-
-    if not message.text:
-        return
-    if message.text.startswith("/"):
-        return
-
-    low = message.text.strip().lower()
-    low_clean = low.strip("?!.,;: ")
-    if low_clean in (
-        "кто ты", "кто это", "who are you", "who r u",
-        "кто ты такой", "кто ты такая", "чё ты", "че ты",
-    ):
-        user_id, name, err = await resolve_target(message)
-        if err:
-            user_id, name = None, None
-        text = await build_stats_message(message, user_id, name)
-        try:
-            await message.answer(text)
-        except Exception:
-            pass
-        return
-
-    # --- Защита от капслока ---
-    if CAPS_ENABLED.get(message.chat.id, False) and is_caps_lock(message.text):
-        try:
-            await message.delete()
-            print(f"Удалён капслок от {message.from_user.id} в {message.chat.id}")
-        except Exception as e:
-            print(f"Не удалил капслок: {e}")
-        return
-
-    # --- Защита от ссылок ---
-    if LINKS_ENABLED.get(message.chat.id, False) and has_forbidden_links(message.text):
-        try:
-            await message.delete()
-            print(f"Удалена ссылка от {message.from_user.id} в {message.chat.id}")
-        except Exception as e:
-            print(f"Не удалил ссылку: {e}")
-        return
-
-    # --- Цензура мата ---
-    if not CENSOR_ENABLED.get(message.chat.id, True):
-        track_message(message.chat.id, message.from_user, is_bad=False)
-        return
-
-    is_bad = has_bad_words(message.text)
-
-    if is_bad:
-        try:
-            await message.delete()
-            print(f"Удалено от {message.from_user.id} в {message.chat.id}")
-        except Exception as e:
-            print(f"Не удалил мат: {e}")
-        return
-
-    track_message(message.chat.id, message.from_user, is_bad=False)
-
-
-# ==================== РЕГИСТРАЦИЯ ====================
-
-async def set_commands():
-    commands = [
-        types.BotCommand(command="start", description="Запустить бота"),
-        types.BotCommand(command="help", description="Все команды"),
-        types.BotCommand(command="everyone", description="Созвать всех"),
-        types.BotCommand(command="rps", description="КНБ с ботом или @user"),
-        types.BotCommand(command="dice", description="Кубик"),
-        types.BotCommand(command="coin", description="Орёл/решка"),
-        types.BotCommand(command="ball", description="Магический шар"),
-        types.BotCommand(command="stats", description="Статистика пользователя"),
-        types.BotCommand(command="whoareyou", description="Кто этот пользователь"),
-        types.BotCommand(command="delete", description="Удалить (reply)"),
-        types.BotCommand(command="censor", description="Вкл. цензуру"),
-        types.BotCommand(command="uncensor", description="Выкл. цензуру"),
-        types.BotCommand(command="censor_status", description="Статус цензуры"),
-        types.BotCommand(command="caps", description="Вкл. защиту от капслока"),
-        types.BotCommand(command="uncaps", description="Выкл. защиту от капслока"),
-        types.BotCommand(command="caps_status", description="Статус защиты от капслока"),
-        types.BotCommand(command="links", description="Вкл. защиту от ссылок"),
-        types.BotCommand(command="unlinks", description="Выкл. защиту от ссылок"),
-        types.BotCommand(command="links_status", description="Статус защиты от ссылок"),
-        types.BotCommand(command="service_on", description="Вкл. чистку"),
-        types.BotCommand(command="service_off", description="Выкл. чистку"),
-        types.BotCommand(command="service_status", description="Статус чистки"),
-        types.BotCommand(command="users", description="Кого знает бот"),
-        types.BotCommand(command="kick", description="Кик"),
-        types.BotCommand(command="ban", description="Бан"),
-        types.BotCommand(command="unban", description="Разбан"),
-        types.BotCommand(command="tempban", description="Врембан"),
-        types.BotCommand(command="mute", description="Мут"),
-        types.BotCommand(command="vmute", description="Мут голосовых"),
-        types.BotCommand(command="unmute", description="Размут"),
-        types.BotCommand(command="addsuper", description="Добавить супер-админа"),
-        types.BotCommand(command="delsuper", description="Убрать супер-админа"),
-        types.BotCommand(command="superlist", description="Список супер-админов"),
-    ]
     try:
-        await bot.set_my_commands(commands)
-    except Exception as e:
-        print(f"set_my_commands: {e}")
+        target_id = int(data["user_id"])
+        role_id = int(data["role_id"])
+    except (KeyError, TypeError, ValueError):
+        raise web.HTTPBadRequest(text="Неверные данные")
+
+    with db() as conn:
+        require_permission(conn, uid, "manage_members")
+
+        role = get_role(conn, role_id)
+
+        check_role_hierarchy(conn, uid, role)
+
+        target = conn.execute(
+            "SELECT id FROM users WHERE id = ?",
+            (target_id,)
+        ).fetchone()
+
+        if not target:
+            raise web.HTTPNotFound(text="Участник не найден")
+
+        if role["name"] == "Владелец" and target_id != OWNER_ID:
+            raise web.HTTPForbidden(
+                text="Роль владельца нельзя выдавать другим участникам"
+            )
+
+        if target_id == OWNER_ID and uid != OWNER_ID:
+            raise web.HTTPForbidden(
+                text="Нельзя менять роли владельца"
+            )
+
+        if uid != OWNER_ID:
+            if highest_position(conn, target_id) >= highest_position(conn, uid):
+                raise web.HTTPForbidden(
+                    text="Нельзя менять роли участника равного или более высокого уровня"
+                )
+
+        conn.execute("""
+            INSERT OR IGNORE INTO user_roles (user_id, role_id)
+            VALUES (?, ?)
+        """, (target_id, role_id))
+
+    return web.json_response(get_state(uid))
 
 
-# ==================== ЗАПУСК ====================
+async def api_remove_role(request):
+    uid = authenticated_user(request)
+
+    try:
+        target_id = int(request.query["user_id"])
+        role_id = int(request.query["role_id"])
+    except (KeyError, ValueError):
+        raise web.HTTPBadRequest(text="Неверные параметры")
+
+    with db() as conn:
+        require_permission(conn, uid, "manage_members")
+
+        role = get_role(conn, role_id)
+
+        check_role_hierarchy(conn, uid, role)
+
+        if role["name"] == "Владелец":
+            raise web.HTTPForbidden(
+                text="Роль владельца нельзя снять"
+            )
+
+        if role["protected"] and uid != OWNER_ID:
+            raise web.HTTPForbidden(
+                text="Стартовые роли может снимать только владелец"
+            )
+
+        if target_id == OWNER_ID and uid != OWNER_ID:
+            raise web.HTTPForbidden(
+                text="Нельзя менять роли владельца"
+            )
+
+        if uid != OWNER_ID:
+            if highest_position(conn, target_id) >= highest_position(conn, uid):
+                raise web.HTTPForbidden(
+                    text="Недостаточный уровень доступа"
+                )
+
+        conn.execute("""
+            DELETE FROM user_roles
+            WHERE user_id = ? AND role_id = ?
+        """, (target_id, role_id))
+
+    return web.json_response(get_state(uid))
+
+
+# ============================================================
+# TELEGRAM BOT
+# ============================================================
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(
+                    text="Открыть TELEGRAMM CHAT",
+                    web_app=WebAppInfo(url=WEBAPP_URL)
+                )
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+    await message.answer(
+        "Добро пожаловать в TELEGRAMM CHAT!\n\n"
+        "Нажми кнопку ниже, чтобы открыть чат.",
+        reply_markup=keyboard
+    )
+
+
+# ============================================================
+# WEB INTERFACE
+# ============================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+
+<title>TELEGRAMM CHAT</title>
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+<style>
+:root {
+    --bg: #313338;
+    --panel: #2b2d31;
+    --side: #1e1f22;
+    --text: #f2f3f5;
+    --muted: #949ba4;
+    --accent: #5865f2;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Arial, sans-serif;
+}
+
+.app {
+    height: 100dvh;
+    display: grid;
+    grid-template-columns: 230px 1fr 210px;
+    overflow: hidden;
+}
+
+.left {
+    background: var(--side);
+    padding: 14px;
+    overflow-y: auto;
+}
+
+.brand {
+    font-size: 17px;
+    font-weight: 800;
+    margin: 5px 0 25px;
+}
+
+.section {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: bold;
+    margin: 18px 0 8px;
+}
+
+.channel {
+    background: #3f4147;
+    padding: 10px;
+    border-radius: 6px;
+}
+
+.center {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.top {
+    height: 52px;
+    display: flex;
+    align-items: center;
+    padding: 0 18px;
+    font-weight: bold;
+    border-bottom: 1px solid #25262a;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px;
+}
+
+.msg {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 18px;
+}
+
+.avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #5865f2;
+    display: grid;
+    place-items: center;
+    font-weight: bold;
+    flex-shrink: 0;
+}
+
+.name {
+    font-weight: bold;
+}
+
+.time {
+    color: var(--muted);
+    font-size: 11px;
+    margin-left: 8px;
+}
+
+.content {
+    margin-top: 5px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+}
+
+.composer {
+    padding: 12px 18px 18px;
+}
+
+.composebox {
+    display: flex;
+    gap: 8px;
+    background: #383a40;
+    border-radius: 9px;
+    padding: 8px;
+}
+
+.composebox input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    color: white;
+    outline: none;
+    padding: 7px;
+}
+
+.btn {
+    background: var(--accent);
+    color: white;
+    border: 0;
+    border-radius: 7px;
+    padding: 8px 13px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.right {
+    background: var(--panel);
+    padding: 14px;
+    overflow-y: auto;
+}
+
+.member {
+    padding: 8px 5px;
+}
+
+.member small {
+    display: block;
+    margin-top: 4px;
+}
+
+.role {
+    font-size: 11px;
+    font-weight: bold;
+}
+
+.tools {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.tool {
+    background: #404249;
+    color: white;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px;
+    cursor: pointer;
+}
+
+.modal {
+    position: fixed;
+    inset: 0;
+    background: #0009;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+}
+
+.dialog {
+    background: #2b2d31;
+    border-radius: 12px;
+    padding: 18px;
+    width: min(440px, 100%);
+    max-height: 85vh;
+    overflow-y: auto;
+}
+
+.dialog input:not([type="checkbox"]) {
+    width: 100%;
+    background: #1e1f22;
+    color: white;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 9px;
+    margin: 6px 0 12px;
+}
+
+.perm {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin: 10px 0;
+}
+
+@media(max-width:760px) {
+    .app {
+        grid-template-columns: 66px 1fr;
+    }
+
+    .left {
+        padding: 12px 7px;
+    }
+
+    .brand {
+        font-size: 0;
+    }
+
+    .brand:after {
+        content: "TC";
+        font-size: 17px;
+    }
+
+    .right {
+        display: none;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<div class="app">
+
+    <aside class="left">
+
+        <div class="brand">TELEGRAMM CHAT</div>
+
+        <div class="section">ТЕКСТОВЫЕ КАНАЛЫ</div>
+
+        <div class="channel">
+            #　общий-чат
+        </div>
+
+        <div class="section">УПРАВЛЕНИЕ</div>
+
+        <div class="tools">
+            <button class="tool" onclick="openRole()">
+                ＋ Роль
+            </button>
+
+            <button class="tool" onclick="openMembers()">
+                Участники
+            </button>
+        </div>
+
+        <div class="section">ВАШИ РОЛИ</div>
+
+        <div id="myroles"></div>
+
+    </aside>
+
+
+    <main class="center">
+
+        <header class="top">
+            #　общий-чат
+        </header>
+
+        <section class="messages" id="messages"></section>
+
+        <footer class="composer">
+
+            <div class="composebox">
+
+                <input
+                    id="message"
+                    placeholder="Написать сообщение..."
+                    maxlength="2000"
+                >
+
+                <button class="btn" onclick="sendMessage()">
+                    ➤
+                </button>
+
+            </div>
+
+        </footer>
+
+    </main>
+
+
+    <aside class="right">
+
+        <div class="section">
+            УЧАСТНИКИ — <span id="count">0</span>
+        </div>
+
+        <div id="members"></div>
+
+    </aside>
+
+</div>
+
+
+<div class="modal" id="modal">
+    <div class="dialog" id="dialog"></div>
+</div>
+
+
+<script>
+
+const tg = window.Telegram.WebApp;
+
+tg.ready();
+tg.expand();
+
+let state = null;
+let uid = null;
+
+const $ = id => document.getElementById(id);
+
+function escapeHTML(value) {
+    return String(value ?? "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+    })[char]);
+}
+
+function headers() {
+    return {
+        "Content-Type": "application/json",
+        "X-Telegram-Init-Data": tg.initData
+    };
+}
+
+async function api(path, options = {}) {
+
+    const response = await fetch(path, {
+        ...options,
+        headers: {
+            ...headers(),
+            ...(options.headers || {})
+        }
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        throw new Error(data.detail || "Ошибка");
+    }
+
+    return data;
+}
+
+function hasPermission(permission) {
+
+    return state.me.is_owner ||
+        state.me.permissions.includes("*") ||
+        state.me.permissions.includes(permission);
+}
+
+function getRoles(ids) {
+
+    return ids
+        .map(id => state.roles.find(role => role.id === id))
+        .filter(Boolean);
+}
+
+
+// ============================================================
+// RENDER
+// ============================================================
+
+function render() {
+
+    const me = state.users.find(user => user.id === uid);
+
+    $("count").textContent = state.users.length;
+
+    $("myroles").innerHTML = getRoles(me?.role_ids || [])
+        .map(role => `
+            <div style="padding:5px;color:${role.color}">
+                ● ${escapeHTML(role.name)}
+            </div>
+        `).join("");
+
+
+    $("members").innerHTML = state.users.map(user => {
+
+        const roles = getRoles(user.role_ids);
+
+        return `
+            <div class="member">
+
+                <b>${escapeHTML(user.first_name)}</b>
+
+                ${roles.map(role => `
+                    <small style="color:${role.color}">
+                        ● ${escapeHTML(role.name)}
+                    </small>
+                `).join("")}
+
+            </div>
+        `;
+
+    }).join("");
+
+
+    $("messages").innerHTML = state.messages.map(message => {
+
+        return `
+            <div class="msg">
+
+                <div class="avatar">
+                    ${escapeHTML(message.name.slice(0, 1).toUpperCase())}
+                </div>
+
+                <div>
+
+                    <div>
+                        <span class="name">
+                            ${escapeHTML(message.name)}
+                        </span>
+
+                        <span class="time">
+                            ${new Date(message.created_at).toLocaleTimeString([], {
+                                hour: "2-digit",
+                                minute: "2-digit"
+                            })}
+                        </span>
+                    </div>
+
+                    <div class="content">
+                        ${formatMessage(message.text)}
+                    </div>
+
+                </div>
+
+            </div>
+        `;
+
+    }).join("");
+
+    $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+
+function formatMessage(text) {
+
+    let result = escapeHTML(text);
+
+    result = result.replace(/@\[([^\]]+)\]/g, (_, name) => {
+
+        const role = state.roles.find(
+            item => item.name.toLowerCase() === name.toLowerCase()
+        );
+
+        const color = role?.color || "#aeb5ff";
+
+        return `
+            <b style="color:${color}">
+                @${escapeHTML(name)}
+            </b>
+        `;
+    });
+
+    return result;
+}
+
+
+// ============================================================
+// MESSAGES
+// ============================================================
+
+async function sendMessage() {
+
+    const input = $("message");
+    const text = input.value.trim();
+
+    if (!text) return;
+
+    try {
+
+        await api("/api/messages", {
+            method: "POST",
+            body: JSON.stringify({ text })
+        });
+
+        input.value = "";
+
+        await refresh();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+
+$("message").addEventListener("keydown", event => {
+
+    if (event.key === "Enter") {
+        event.preventDefault();
+        sendMessage();
+    }
+
+});
+
+
+// ============================================================
+// MODALS
+// ============================================================
+
+function closeModal() {
+    $("modal").style.display = "none";
+}
+
+function showModal(html) {
+    $("dialog").innerHTML = html;
+    $("modal").style.display = "flex";
+}
+
+
+// ============================================================
+// ROLE MANAGEMENT
+// ============================================================
+
+function openRole(role = null) {
+
+    if (!hasPermission("manage_roles")) {
+        return alert("Недостаточно прав");
+    }
+
+    const permissions = [
+        ["manage_roles", "Управление ролями"],
+        ["manage_members", "Управление участниками"],
+        ["manage_permissions", "Настройка прав"],
+        ["mention_roles", "Упоминание ролей"]
+    ];
+
+    showModal(`
+
+        <h3>${role ? "Изменить роль" : "Создать роль"}</h3>
+
+        <label>Название</label>
+
+        <input
+            id="roleName"
+            maxlength="32"
+            value="${escapeHTML(role?.name || "")}"
+        >
+
+        <label>Цвет</label>
+
+        <input
+            id="roleColor"
+            type="color"
+            value="${role?.color || "#5865f2"}"
+        >
+
+        <label>Позиция в иерархии</label>
+
+        <input
+            id="rolePosition"
+            type="number"
+            min="1"
+            max="8999"
+            value="${role?.position || 10}"
+        >
+
+        <div class="section">ПРАВА РОЛИ</div>
+
+        ${permissions.map(([permission, label]) => `
+
+            <label class="perm">
+
+                <input
+                    type="checkbox"
+                    value="${permission}"
+                    ${role?.permissions?.includes(permission) ? "checked" : ""}
+                    ${!hasPermission("manage_permissions") ? "disabled" : ""}
+                >
+
+                ${label}
+
+            </label>
+
+        `).join("")}
+
+        <div class="tools">
+
+            <button class="btn" onclick="saveRole(${role?.id || 0})">
+                Сохранить
+            </button>
+
+            <button class="tool" onclick="closeModal()">
+                Отмена
+            </button>
+
+            ${role && !role.protected ? `
+                <button class="tool" onclick="deleteRole(${role.id})">
+                    Удалить
+                </button>
+            ` : ""}
+
+        </div>
+
+    `);
+}
+
+
+async function saveRole(roleId) {
+
+    const permissions = [
+        ...document.querySelectorAll(
+            "#dialog input[type=checkbox]:checked"
+        )
+    ].map(input => input.value);
+
+    const data = {
+        name: $("roleName").value.trim(),
+        color: $("roleColor").value,
+        position: Number($("rolePosition").value),
+        permissions
+    };
+
+    try {
+
+        state = await api(
+            roleId ? `/api/roles/${roleId}` : "/api/roles",
+            {
+                method: roleId ? "PUT" : "POST",
+                body: JSON.stringify(data)
+            }
+        );
+
+        closeModal();
+        render();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+
+async function deleteRole(roleId) {
+
+    if (!confirm("Удалить эту роль?")) return;
+
+    try {
+
+        state = await api(`/api/roles/${roleId}`, {
+            method: "DELETE"
+        });
+
+        closeModal();
+        render();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+
+// ============================================================
+// MEMBER MANAGEMENT
+// ============================================================
+
+function openMembers() {
+
+    if (!hasPermission("manage_members")) {
+        return alert("Недостаточно прав");
+    }
+
+    showModal(`
+
+        <h3>Управление участниками</h3>
+
+        ${state.users.map(user => {
+
+            const roles = state.roles.filter(role =>
+                role.name !== "Владелец" &&
+                (state.me.is_owner || !role.protected)
+            );
+
+            return `
+
+                <div style="padding:10px 0;border-bottom:1px solid #444">
+
+                    <b>${escapeHTML(user.first_name)}</b>
+
+                    <div>
+
+                        ${roles.map(role => `
+
+                            <button
+                                class="tool"
+                                style="margin:4px;color:${role.color}"
+                                onclick="toggleRole(
+                                    ${user.id},
+                                    ${role.id},
+                                    ${user.role_ids.includes(role.id)}
+                                )"
+                            >
+
+                                ${user.role_ids.includes(role.id) ? "−" : "+"}
+                                ${escapeHTML(role.name)}
+
+                            </button>
+
+                        `).join("")}
+
+                    </div>
+
+                </div>
+
+            `;
+
+        }).join("")}
+
+        <button class="tool" onclick="closeModal()">
+            Закрыть
+        </button>
+
+    `);
+}
+
+
+async function toggleRole(userId, roleId, assigned) {
+
+    try {
+
+        if (assigned) {
+
+            state = await api(
+                `/api/roles/assign?user_id=${userId}&role_id=${roleId}`,
+                { method: "DELETE" }
+            );
+
+        } else {
+
+            state = await api("/api/roles/assign", {
+                method: "POST",
+                body: JSON.stringify({
+                    user_id: userId,
+                    role_id: roleId
+                })
+            });
+
+        }
+
+        openMembers();
+        render();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+
+// ============================================================
+// REFRESH
+// ============================================================
+
+async function refresh() {
+
+    try {
+        state = await api("/api/state");
+        render();
+    } catch (error) {
+        console.error(error);
+    }
+}
+
+
+// ============================================================
+// START
+// ============================================================
+
+async function boot() {
+
+    if (!tg.initData) {
+
+        document.body.innerHTML = `
+            <div style="padding:24px">
+                Откройте приложение через Telegram.
+            </div>
+        `;
+
+        return;
+    }
+
+    try {
+
+        const response = await fetch("/api/auth", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                init_data: tg.initData
+            })
+        });
+
+        state = await response.json();
+
+        if (!response.ok) {
+            throw new Error(state.detail || "Ошибка авторизации");
+        }
+
+        uid = state.me.id;
+
+        render();
+
+        setInterval(refresh, 3000);
+
+    } catch (error) {
+
+        document.body.innerHTML = `
+            <div style="padding:24px">
+                ${escapeHTML(error.message)}
+            </div>
+        `;
+
+    }
+}
+
+boot();
+
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
+
+async def index(request):
+    return web.Response(
+        text=HTML,
+        content_type="text/html"
+    )
+
+
+def create_web_app():
+
+    app = web.Application()
+
+    app.router.add_get("/", index)
+
+    app.router.add_post("/api/auth", api_auth)
+    app.router.add_get("/api/state", api_state)
+
+    app.router.add_post("/api/messages", api_send_message)
+
+    app.router.add_post("/api/roles", api_create_role)
+    app.router.add_put("/api/roles/{role_id}", api_edit_role)
+    app.router.add_delete("/api/roles/{role_id}", api_delete_role)
+
+    app.router.add_post("/api/roles/assign", api_assign_role)
+    app.router.add_delete("/api/roles/assign", api_remove_role)
+
+    return app
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 async def main():
-    global BOT_ID
-    print("=== MAIN START ===")
+
+    if BOT_TOKEN == "YOUR_BOT_TOKEN":
+        raise RuntimeError("Укажите BOT_TOKEN")
+
+    if OWNER_ID == 123456789:
+        raise RuntimeError("Укажите OWNER_ID")
+
+    init_db()
+
+    runner = web.AppRunner(create_web_app())
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=WEB_PORT
+    )
+
+    await site.start()
+
+    print(f"TELEGRAMM CHAT запущен на порту {WEB_PORT}")
+
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print(f"delete_webhook: {e}")
-
-    me = await bot.get_me()
-    BOT_ID = me.id
-    print(f"Бот: @{me.username} (id={BOT_ID})")
-    print(f"Супер-админы (username): {SUPER_ADMINS}")
-    print(f"Супер-админы (id): {SUPER_ADMIN_IDS}")
-
-    await set_commands()
-    print("=== BOT STARTED, POLLING ===")
-
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    except Exception as e:
-        print(f"Polling упал: {e}")
-        import traceback
-        traceback.print_exc()
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
